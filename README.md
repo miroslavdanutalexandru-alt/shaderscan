@@ -476,5 +476,15 @@ Other projects can run the CLI as a separate program without licence effect on t
   translators the `r1d3d12` back end uses; Resistance 2; Resistance 3.
 - [miniz](https://github.com/richgel999/miniz) by Rich Geldreich, RAD Game Tools and Valve Software.
 
+## Support
+
+shaderscan is free, and it will stay free: there are no paid builds, no early access and no perks.
+If it saved you some stutter and you feel like buying me a coffee, it's genuinely appreciated and keeps
+the late-night tooling sessions going ☕
+[buymeacoffee.com/damiro98](https://buymeacoffee.com/damiro98)
+
+A tip supports my own tools and time. It is not a payment for any game or port, and nothing is unlocked by it.
+If you'd like to support the wider scene, the projects in the credits above deserve it just as much.
+
 *Resistance: Fall of Man*, *Resistance 2* and *Resistance 3* are © Sony Interactive Entertainment, developed by
 Insomniac Games. This is an unofficial fan project, not affiliated with or endorsed by Sony or Insomniac.
