@@ -23,9 +23,9 @@ Setup downloads a pinned release build into `tools\shaderscan.exe`, and their la
 
 | Game | Port | Back end | Cache written |
 |---|---|---|---|
-| Resistance 3 (BCES01905 and others) | [Resistance3Port](https://github.com/miroslavdanutalexandru-alt/Resistance3Port) | `rpcs3` | `<port>\shadercache\rpcs3\shaders_cache` (RPCS3's Vulkan cache: `raw\*.fp`, `raw\*.vp`, `pipelines\vulkan\v1.95\*.bin`) |
-| Resistance 2 | [Resistance2Port](https://github.com/miroslavdanutalexandru-alt/Resistance2Port) | `rpcs3` | same |
-| Resistance: Fall of Man | [Resistance-Fall-of-Man-Recomp](https://github.com/miroslavdanutalexandru-alt/Resistance-Fall-of-Man-Recomp) | `r1d3d12` | `<port>\shadercache` (`<key>.hlsl` + `<key>.dxbc`, the port's own D3D12 renderer) |
+| Resistance 3 (BCES01905 and others) | Resistance3Port (not released yet) | `rpcs3` | `<port>\shadercache\rpcs3\shaders_cache` (RPCS3's Vulkan cache: `raw\*.fp`, `raw\*.vp`, `pipelines\vulkan\v1.95\*.bin`) |
+| Resistance 2 | Resistance2Port (not released yet) | `rpcs3` | same |
+| Resistance: Fall of Man | Resistance-Fall-of-Man-Recomp (not released yet) | `r1d3d12` | `<port>\shadercache` (`<key>.hlsl` + `<key>.dxbc`, the port's own D3D12 renderer) |
 
 The core knows nothing about a particular game or renderer. Engine knowledge lives in small **front ends**
 (`insomniac`, plus the engine-agnostic `signature` research aid). Renderer knowledge (how a program becomes a cache
@@ -471,10 +471,9 @@ Other projects can run the CLI as a separate program without licence effect on t
   shaderscan reproduces, and the renderer the R2/R3 ports embed.
 - [ps3recomp](https://github.com/sp00nznet) by Ned Heller / sp00nznet: the static recompilation framework the ports
   are built on.
-- The Resistance ports: [Resistance: Fall of Man](https://github.com/miroslavdanutalexandru-alt/Resistance-Fall-of-Man-Recomp)
-  (a fork of [Psyykosis' recomp](https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp)), whose RSX to HLSL
-  translators the `r1d3d12` back end uses; [Resistance 2](https://github.com/miroslavdanutalexandru-alt/Resistance2Port);
-  [Resistance 3](https://github.com/miroslavdanutalexandru-alt/Resistance3Port).
+- The Resistance ports (not released yet): Resistance: Fall of Man
+  (based on [Psyykosis' recomp](https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp)), whose RSX to HLSL
+  translators the `r1d3d12` back end uses; Resistance 2; Resistance 3.
 - [miniz](https://github.com/richgel999/miniz) by Rich Geldreich, RAD Game Tools and Valve Software.
 
 *Resistance: Fall of Man*, *Resistance 2* and *Resistance 3* are © Sony Interactive Entertainment, developed by
