@@ -1,0 +1,21 @@
+# Build output and local scratch
+/build*/
+/dist/
+/verify/
+/out/
+/.vs/
+/.vscode/
+CMakeUserPresets.json
+*.user
+
+# Release notes drafts (kept local)
+/COMMIT_NOTES.md
+
+# Never commit game data or caches generated from it
+*.elf
+*.self
+*.sprx
+*.psarc
+EBOOT.BIN
+shaders_cache/
+shadercache/
