@@ -8,14 +8,19 @@ byte for byte.
 |---|---|
 | `libs/video/rsx_fp_decompiler.c`, `.h` | `ps3recomp/libs/video/` |
 | `libs/video/rsx_vp_decompiler.c`, `.h` | `ps3recomp/libs/video/` |
+| `libs/video/rsx_ext_state.h` | `ps3recomp/libs/video/` (fragment fog / flat / two-side / border patch, IEEE-strict VS text) |
 | `include/ps3emu/ps3types.h`, `endian.h`, `log_first.h` | `ps3recomp/include/ps3emu/` |
 
-- Source: https://github.com/miroslavdanutalexandru-alt/Resistance-Fall-of-Man-Recomp (branch `dlss-upscaling`,
-  commit `337e30fcbdbfa15de6e42fb29c6963489c88797c`), a fork of
-  https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp.
+- Source: https://github.com/miroslavdanutalexandru-alt/Resistance-Fall-of-Man-Recomp, a fork of
+  https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp. `rsx_vp_decompiler.*` and `include/` are from commit
+  `337e30fcbdbfa15de6e42fb29c6963489c88797c` (branch `dlss-upscaling`); `rsx_fp_decompiler.*` and `rsx_ext_state.h`
+  are from the port's v0.3.0-beta sources (shaderscan v1.0.1). Parts of `rsx_ext_state.h` are adapted from
+  https://github.com/bc160201983/GoW-Ascension-Recomp (MIT, `LICENSE.gow-ascension`; its comments' "THIRD_PARTY.md"
+  is the port's notice file).
 - ps3recomp by Ned Heller / sp00nznet.
 - Licence: **MIT**. `LICENSE.ps3recomp` is ps3recomp's licence and `LICENSE.rfom-port` the port's licence (it covers
-  the port's changes to ps3recomp). Both notices must be kept with these files.
+  the port's changes to ps3recomp). `LICENSE.gow-ascension` covers the adapted parts of `rsx_ext_state.h`. All
+  notices must be kept with these files.
 
 The layout mirrors the port (`libs/video` next to `include`), so `-DSHADERSCAN_R1_VIDEO_DIR=<ResistancePort>\ps3recomp\libs\video`
 can point the build at a checkout instead. Update this copy when the port's translators change: `shaderscan --verify

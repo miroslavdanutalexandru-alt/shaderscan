@@ -32,6 +32,24 @@ static double fp_res_inv(void)
     return inv;
 }
 
+/* RSX_FP_EXTOPS (default 1): translate DDX/DDY, TXD, DST, LIT, STR, SFL, BEM,
+ * DP2A, RFL and TEXBEM/TXPBEM per RPCS3 FragmentProgramDecompiler. 0 restores
+ * the old "unhandled opcode" comments (the instruction is dropped). */
+int rsx_fp_extops(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_EXTOPS"); v = e ? atoi(e) != 0 : 1; }
+    return v;
+}
+/* RSX_FP_RFL (default 0): 0 = NV_fragment_program RFL, 2*dot(a,b)/dot(a,a)*a - b
+ * (a = axis, need not be unit length); 1 = RPCS3's reflect(a, b). */
+static int fp_rfl_rpcs3(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_RFL"); v = e ? atoi(e) != 0 : 0; }
+    return v;
+}
+
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
 #define FP_OUT_REG_SHIFT    1
@@ -89,7 +107,7 @@ enum {
     OP_TXD=0x19, OP_RCP=0x1A, OP_RSQ=0x1B, OP_EX2=0x1C, OP_LG2=0x1D,
     OP_LIT=0x1E, OP_LRP=0x1F, OP_STR=0x20, OP_SFL=0x21, OP_COS=0x22,
     OP_SIN=0x23, OP_PK2H=0x24, OP_UP2H=0x25, OP_POW=0x26, OP_PK4UB=0x27,
-    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_PKG=0x2C, OP_UPG=0x2D, OP_DP2A=0x2E, OP_TXL=0x2F,
+    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_PKG=0x2C, OP_BEM=0x2B, OP_UPG=0x2D, OP_DP2A=0x2E, OP_TXL=0x2F,
     OP_TXB=0x31, OP_TEXBEM=0x33, OP_TXPBEM=0x34, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
     OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
 };
@@ -115,7 +133,8 @@ const char* rsx_fp_opcode_name(u32 op)
     case OP_PK4B: return "PK4B"; case OP_UP4B: return "UP4B"; case OP_PK2H: return "PK2H";
     case OP_UP2H: return "UP2H"; case OP_PK4UB: return "PK4UB"; case OP_UP4UB: return "UP4UB";
     case OP_PK2US: return "PK2US"; case OP_UP2US: return "UP2US"; case OP_PKG: return "PKG";
-    case OP_UPG: return "UPG";
+    case OP_UPG: return "UPG"; case OP_BEM: return "BEM";
+    case OP_TEXBEM: return "TEXBEM"; case OP_TXPBEM: return "TXPBEM";
     case OP_FENCT: return "FENCT"; case OP_FENCB: return "FENCB";
     default:     return "?";
     }
@@ -784,7 +803,7 @@ static int rsx_fp_decompile_internal(
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         if (!(w2 & FP_BRANCH) && shadow && shadow[tex_unit].enabled &&
             (opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TXD ||
-             opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+             ((opcode == OP_TEXBEM || opcode == OP_TXPBEM) && !rsx_fp_extops()))) {
             static u32 n_fetch_errors;
             if (PS3_LOG_FIRST(n_fetch_errors, 32))
                 fprintf(stderr, "[RSX fp] unsupported depth comparison fetch on texture unit %u\n", tex_unit);
@@ -846,10 +865,11 @@ static int rsx_fp_decompile_internal(
          * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
          * address instead. */
         const int persp = !is_branch && (w3 >> 31) != 0;
-        char a[200], b[200], c[200];
+        char a_buf[200], b[200], c[200], bem[640];
+        const char* a = a_buf;
         emit_src(
             &s0, input_src, persp, k, has_k, buffered, constant_slot,
-            a, sizeof(a));
+            a_buf, sizeof(a_buf));
         emit_src(
             &s1, input_src, persp, k, has_k, buffered, constant_slot,
             b, sizeof(b));
@@ -916,8 +936,18 @@ static int rsx_fp_decompile_internal(
             continue;
         }
 
+        /* TEXBEM/TXPBEM (RPCS3: "x2d followed by TEX/TXP"): the coordinate
+         * is BEM(src0, src1, src2) = src0.xyxy + src1.xxxx * src2.xzxz +
+         * src1.yyyy * src2.ywyw, then the fetch is a plain TEX/TXP. */
+        if (rsx_fp_extops() && (opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            const int n = snprintf(bem, sizeof bem,
+                "((%s).xyxy + (%s).xxxx * (%s).xzxz + (%s).yyyy * (%s).ywyw)", a, b, c, b, c);
+            if (n < 0 || (size_t)n >= sizeof bem) return -1;
+            a = bem;
+            opcode = opcode == OP_TEXBEM ? OP_TEX : OP_TXP;
+        }
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            ((opcode == OP_TXD && !rsx_fp_extops()) || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
@@ -1059,6 +1089,46 @@ static int rsx_fp_decompile_internal(
                      cube ? "xyz" : "xy", b);
             break;
         }
+        /* RSX_FP_EXTOPS ops (RPCS3 FragmentProgramDecompiler / GLSLCommon). */
+        case OP_DDX: case OP_DDY: case OP_TXD: case OP_DST: case OP_LIT:
+        case OP_STR: case OP_SFL: case OP_BEM: case OP_DP2A: case OP_RFL:
+            if (!rsx_fp_extops()) goto unhandled;
+            switch (opcode) {
+            /* Derivatives in guest window pixels: SV_Position counts render
+             * pixels (RSX_RES_SCALE) and runs top-down, so DDY flips when the
+             * guest's SHADER_WINDOW origin is the bottom edge (as _rsx_wpos). */
+            case OP_DDX: snprintf(rhs, sizeof(rhs), "_rsx_ddx(%s)", a); break;
+            case OP_DDY: snprintf(rhs, sizeof(rhs), "_rsx_ddy(%s)", a); break;
+            case OP_TXD: {
+                const int vol = (tex_sep_mask >> tex_unit) & 1u;
+                char tn[32];
+                snprintf(tn, sizeof(tn), tex_sep_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+                snprintf(rhs, sizeof(rhs), "%s.SampleGrad(rsx_samp[%u], (%s).%s, _rsx_grad((%s).%s), _rsx_grad((%s).%s))",
+                         tn, tex_unit, a, vol ? "xyz" : "xy", b, vol ? "xyz" : "xy", c, vol ? "xyz" : "xy");
+                break; }
+            case OP_DST: snprintf(rhs, sizeof(rhs), "float4(1.0, (%s).y * (%s).y, (%s).z, (%s).w)", a, b, a, b); break;
+            /* RPCS3 _builtin_lit (RSXProgramCommon.glsl). */
+            case OP_LIT:
+                snprintf(rhs, sizeof(rhs),
+                         "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0) ? exp2((%s).w * log2(max((%s).y, 1e-10))) : 0.0, 1.0)",
+                         a, a, a, a);
+                break;
+            case OP_STR: snprintf(rhs, sizeof(rhs), "(float4)1.0"); break;
+            case OP_SFL: snprintf(rhs, sizeof(rhs), "(float4)0.0"); break;
+            case OP_BEM:
+                snprintf(rhs, sizeof(rhs), "(%s).xyxy + (%s).xxxx * (%s).xzxz + (%s).yyyy * (%s).ywyw", a, b, c, b, c);
+                break;
+            case OP_DP2A: snprintf(rhs, sizeof(rhs), "(dot((%s).xy, (%s).xy) + (%s).x)", a, b, c); break;
+            default: /* OP_RFL */
+                if (fp_rfl_rpcs3())
+                    snprintf(rhs, sizeof(rhs), "float4(reflect((%s).xyz, (%s).xyz), 0.0)", a, b);
+                else
+                    snprintf(rhs, sizeof(rhs),
+                             "float4(2.0 * dot((%s).xyz, (%s).xyz) / dot((%s).xyz, (%s).xyz) * (%s).xyz - (%s).xyz, 0.0)",
+                             a, b, a, a, a, b);
+                break;
+            }
+            break;
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
@@ -1079,7 +1149,7 @@ static int rsx_fp_decompile_internal(
             }
             handled = 0;   /* no destination write */
             break;
-        default: {
+        default: unhandled: {
             /* The number and the raw words, so an opcode outside the table
              * can be identified from the dumped shader alone. */
             char todo[160];
@@ -1093,7 +1163,8 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             (opcode == OP_TXD && rsx_fp_extops()))) {
             char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
             const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
                                         sample, gamma_masks[tex_unit] & 15u);
@@ -1108,7 +1179,8 @@ static int rsx_fp_decompile_internal(
          * A comparison fetch has nothing to expand. */
         if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
             !(shadow && shadow[tex_unit].enabled) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             (opcode == OP_TXD && rsx_fp_extops()))) {
             const int bx2 = (w0 & (1u << 21)) != 0;
             u32 mask = bx2 ? 15u : (expand_masks[tex_unit] & 0x1Fu);
             if (!bx2 && gamma_masks) mask &= ~(gamma_masks[tex_unit] & 15u);
@@ -1349,6 +1421,17 @@ static int rsx_fp_decompile_internal(
             out_puts(&p, wl);
         }
     }
+    /* RSX_FP_EXTOPS derivatives: per guest window pixel, guest y direction. */
+    const int uses_ddy = strstr(o.p, "_rsx_ddy(") != NULL;
+    if (strstr(o.p, "_rsx_ddx(") || uses_ddy || strstr(o.p, "_rsx_grad(")) {
+        char dl[400];
+        const double ri = fp_res_inv();
+        snprintf(dl, sizeof dl,
+            "#define _rsx_ddx(v) (ddx(v) / %.9g)\n"
+            "#define _rsx_ddy(v) (((rsx_shscale.z > 0.5) ? -ddy(v) : ddy(v)) / %.9g)\n"
+            "#define _rsx_grad(g) ((g) * %.9g)\n", ri, ri, ri);
+        out_puts(&p, dl);
+    }
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1382,7 +1465,7 @@ static int rsx_fp_decompile_internal(
     if (shadow)
         for (u32 u = 0; u < 16; u++)
             if ((sampled_units & (1u << u)) && shadow[u].enabled) any_sh = 1;
-    if (!any_sh && uses_wpos) {
+    if (!any_sh && (uses_wpos || uses_ddy)) {
         /* WPOS without a shadow map still needs rsx_shscale (same b1 slot,
          * same declaration, so the alpha-test patcher extends it as usual) */
         if (!buffered)

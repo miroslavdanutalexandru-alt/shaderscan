@@ -23,9 +23,9 @@ Setup downloads a pinned release build into `tools\shaderscan.exe`, and their la
 
 | Game | Port | Back end | Cache written |
 |---|---|---|---|
-| Resistance 3 (BCES01905 and others) | Resistance3Port (not released yet) | `rpcs3` | `<port>\shadercache\rpcs3\shaders_cache` (RPCS3's Vulkan cache: `raw\*.fp`, `raw\*.vp`, `pipelines\vulkan\v1.95\*.bin`) |
-| Resistance 2 | Resistance2Port (not released yet) | `rpcs3` | same |
-| Resistance: Fall of Man | Resistance-Fall-of-Man-Recomp (not released yet) | `r1d3d12` | `<port>\shadercache` (`<key>.hlsl` + `<key>.dxbc`, the port's own D3D12 renderer) |
+| Resistance 3 (BCES01905 and others) | [Resistance3Port](https://github.com/miroslavdanutalexandru-alt/Resistance3Port) (v0.3.0-beta) | `rpcs3` | `<port>\shadercache\rpcs3\shaders_cache` (RPCS3's Vulkan cache: `raw\*.fp`, `raw\*.vp`, `pipelines\vulkan\v1.95\*.bin`) |
+| Resistance 2 | [Resistance2Port](https://github.com/miroslavdanutalexandru-alt/Resistance2Port) (v0.3.0-beta) | `rpcs3` | same |
+| Resistance: Fall of Man | [Resistance-Fall-of-Man-Recomp](https://github.com/miroslavdanutalexandru-alt/Resistance-Fall-of-Man-Recomp) (v0.3.0-beta) | `r1d3d12` | `<port>\shadercache` (`<key>.hlsl` + `<key>.dxbc`, the port's own D3D12 renderer) |
 
 The core knows nothing about a particular game or renderer. Engine knowledge lives in small **front ends**
 (`insomniac`, plus the engine-agnostic `signature` research aid). Renderer knowledge (how a program becomes a cache
@@ -90,19 +90,24 @@ and as many GPL parts as possible before the first frame.
 R1 has its own D3D12 renderer: RSX ucode → HLSL (`rsx_fp_decompiler.c` / `rsx_vp_decompiler.c`) → `D3DCompile`
 (system `d3dcompiler_47`, flags 0, `ps_5_0` / `vs_5_0`) → `shadercache\<key>.dxbc` plus `<key>.hlsl`. The key is
 FNV-1a 64 over `"rfom-shc-v1"`, target, entry `"main"` and the HLSL; there is no driver or version check, the key is
-the validation.
+the validation. With `RSX_VS_STRICT` on (the port's default unless the GPU is NVIDIA), vertex shaders use the tag
+`"rfom-shc-v1s"` and are compiled with `D3DCOMPILE_IEEE_STRICTNESS`; shaderscan detects the GPU the way the game
+does.
 
 - **Where the programs live:** only in `game\EBOOT.elf` (329 FP + 171 VP unique). There is no `shaders.dat` and no
   runtime assembly. The `insomniac` front end's EBOOT header scan covers it.
 - **Translator:** the port's own translator sources, vendored under `third_party\rfom_translators` (MIT), so the
   generated HLSL is the game's byte for byte. `src\r1d3d12\r1_glue.c` holds verbatim copies of the renderer's text
-  steps: FP state wrapper, VP and `SV_VertexID` (gf) forms, the motion-vector VS/PS, and the key.
+  steps: FP state wrapper, fog / flat / two-side / border patch, VP and `SV_VertexID` (gf) forms, the motion-vector
+  VS/PS, the strict VS text, and the key.
 - **Variants:** fragment state (shadow compare, expand, unnormalised dims, clamp/mirror, exp32) comes from draw
   state. It is learned from the recorded `.hlsl` files (`--learn`), the embedded `profiles\r1_profile.inc`, and a
   generic top-K (`--variants`, default 4). The VS gets plain, gf, and the MV forms when `RSX_FSR` > 0.
-- **Environment:** `RSX_RES_SCALE`, `RSX_FSR`, `RSX_FSR_REACTIVE` are read like the runtime sees them (`run.bat` /
-  `settings.bat` `set` lines, then the process environment) and fingerprinted in the stamp, so changing the scale
-  makes `--check` ask for a rescan.
+- **Environment:** `RSX_RES_SCALE`, `RSX_FSR`, `RSX_FSR_REACTIVE`, `RSX_VS_STRICT`, `RSX_FOG`, `RSX_FLAT_SHADE`,
+  `RSX_TWO_SIDE_LIGHT`, `RSX_BORDER_COLOR`, `RSX_FP_EXTOPS` and `RSX_FP_RFL` are read like the runtime sees them
+  (`run.bat` / `settings.bat` `set` lines, then the process environment) and fingerprinted in the stamp, so changing
+  the scale makes `--check` ask for a rescan. The stamp also records the motion-shader text revision (`mvtext`) and
+  whether vertex shaders were strict (`vsstrict`).
 - **Verify:** `--verify <shadercache>` re-derives every key from its `.hlsl` and recompiles it, comparing the DXBC.
 - **Not covered:** `pso_manifest_*2.bin` (the game's list of PSOs to build at start-up) needs the root signature,
   blend, raster and render-target state of real draws, so it is left to the game. The first draw of a new state
@@ -471,7 +476,7 @@ Other projects can run the CLI as a separate program without licence effect on t
   shaderscan reproduces, and the renderer the R2/R3 ports embed.
 - [ps3recomp](https://github.com/sp00nznet) by Ned Heller / sp00nznet: the static recompilation framework the ports
   are built on.
-- The Resistance ports (not released yet): Resistance: Fall of Man
+- The Resistance ports (v0.3.0-beta): Resistance: Fall of Man
   (based on [Psyykosis' recomp](https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp)), whose RSX to HLSL
   translators the `r1d3d12` back end uses; Resistance 2; Resistance 3.
 - [miniz](https://github.com/richgel999/miniz) by Rich Geldreich, RAD Game Tools and Valve Software.

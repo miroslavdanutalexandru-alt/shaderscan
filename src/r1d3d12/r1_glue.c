@@ -1,8 +1,10 @@
 /* shaderscan r1d3d12 back end glue. SPDX-License-Identifier: GPL-2.0-only
  *
  * Verbatim copies of the post-processing statics of the R1 port's ps3recomp/libs/video/rsx_d3d12_backend.c
- * (hlsl_replace_all, fp_str_replace, fp_apply_clamp_samplers, fp_unify_b1, s_gf_hlsl_helpers, gf_make_text and
- * the inline unnorm/mirror blocks of vp_get_fp_pso), arranged in the order vp_get_fp_pso applies them. If the
+ * (hlsl_replace_all, fp_str_replace, fp_apply_clamp_samplers, fp_unify_b1, s_gf_hlsl_helpers, gf_make_text,
+ * shc_strict_text, the inline unnorm/mirror blocks of vp_get_fp_pso and its rsx_fpx_patch_m call) and of rsx_fsr.inc
+ * (the motion-vector shaders and mv_prune_main), arranged in the order the runtime applies them. rsx_ext_state.h
+ * (fog / flat / two-side / border FP patch, VS variants, strict VS text) is the port's own header, vendored whole. If the
  * runtime changes one of these, `shaderscan --verify <R1 shadercache>` reports key mismatches; recopy then. */
 #include "r1_glue.h"
 
@@ -12,6 +14,7 @@
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_vp_decompiler.h"
+#include "rsx_ext_state.h"
 
 extern int g_rsx_fp_kslot_mode;
 
@@ -184,6 +187,23 @@ int r1_fp_hlsl(const uint8_t* ucode, const r1_fp_variant* v, char* hlsl, uint32_
         }
     }
     fp_unify_b1(hlsl, cap);
+    /* fp_set_unnorm / draw record: RSX_FOG on every draw, the other bits per draw state and their own switches;
+     * a failed patch leaves the text unchanged (as the runtime) */
+    {
+        static int fog = -1, flat = -1, two = -1, border = -1;
+        if (fog < 0) {
+            const char* e;
+            e = getenv("RSX_FOG");            fog = e ? atoi(e) : 1;
+            e = getenv("RSX_FLAT_SHADE");     flat = e ? atoi(e) : 1;
+            e = getenv("RSX_TWO_SIDE_LIGHT"); two = e ? atoi(e) : 1;
+            e = getenv("RSX_BORDER_COLOR");   border = e ? atoi(e) : 1;
+        }
+        uint64_t x = fog ? RSX_FPX_FOG : 0u;
+        if (flat) x |= v->fpx & RSX_FPX_FLAT;
+        if (two) x |= v->fpx & RSX_FPX_TWOSIDE;
+        if (border) x |= v->fpx & ((0xFFFFull << RSX_FPX_BORDER_SHIFT) | (0xFFFFull << RSX_FPX_BORDERV_SHIFT));
+        if (x) rsx_fpx_patch_m(hlsl, cap, x, v->bmirror);
+    }
     return n;
 }
 
@@ -264,9 +284,10 @@ char* r1_gf_text(const char* hlsl, size_t* olen)
 static const char s_mv_ps_hlsl[] =
 "struct MVOut { float4 pos:SV_Position; float4 cur:TEXCOORD0; float4 prv:TEXCOORD1; };\n"
 "struct MVT { float2 mv:SV_Target0; float z:SV_Target1; float rx:SV_Target2; };\n"
+"cbuffer MVK : register(b4) { float4 mv_k; };\n"
 "#ifndef RXV\n#define RXV 0.0\n#endif\n"
 "MVT main(MVOut i) {\n"
-"    MVT o; o.rx = RXV; o.z = i.prv.z > 1e29 ? i.cur.z : i.pos.z;\n"
+"    MVT o; o.rx = RXV; o.z = i.prv.z > 1e29 ? i.cur.z : i.prv.z < -0.5 ? (mv_k.w < -1.5 ? -3.0 : -1.0) - saturate(i.pos.z) : i.pos.z;\n"
 "    if (abs(i.prv.w) < 1e-6 || abs(i.cur.w) < 1e-6) { o.mv = float2(0, 0); return o; }\n"
 "    float2 c = i.cur.xy / i.cur.w, p = i.prv.xy / i.prv.w;\n"
 "    o.mv = (p - c) * float2(0.5, -0.5);\n"
@@ -299,21 +320,232 @@ static char* mv_subst(const char* s, size_t n, const char* const* from, const ch
     return out;
 }
 
-char* r1_mv_vs_text(const char* base)
+/* ---- rsx_fsr.inc: mv_prune_main and helpers (RSX_FSR_MV_PRUNE), mv_make_vs_text --------------------------- */
+#define MVP_REGS 64
+typedef struct { const char* p; size_t n; u8 isv, ndef; u8 dk[8], di[8], dm[8], dc[8]; u64 use[5]; } MvpStmt;
+static int mvp_ident(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+static int mvp_lit(const char* s, const char* e, const char* lit)
+{
+    const size_t L = strlen(lit);
+    return (size_t)(e - s) >= L && !memcmp(s, lit, L);
+}
+/* register reads in [s, e): r o v cc (constant index) and a0/a1. 0 = not modelled. */
+static int mvp_uses(const char* s, const char* e, u64 use[5])
+{
+    static const char* const pre[4] = { "cc[", "r[", "o[", "v[" };
+    static const int kind[4] = { 3, 0, 1, 2 };
+    for (const char* p = s; p < e; p++) {
+        if (p > s && mvp_ident(p[-1])) continue;
+        if (*p == 'a' && p + 1 < e && (p[1] == '0' || p[1] == '1') && (p + 2 >= e || !mvp_ident(p[2]))) {
+            use[4] |= 1ull << (p[1] - '0'); p++; continue;
+        }
+        for (int k = 0; k < 4; k++) {
+            if (!mvp_lit(p, e, pre[k])) continue;
+            const char* q = p + strlen(pre[k]);
+            int idx = 0, nd = 0;
+            while (q < e && *q >= '0' && *q <= '9' && nd < 3) { idx = idx * 10 + (*q - '0'); q++; nd++; }
+            if (!nd || q >= e || *q != ']' || idx >= MVP_REGS) return 0;
+            use[kind[k]] |= 1ull << idx;
+            p = q;
+            break;
+        }
+    }
+    return 1;
+}
+static int mvp_mask(const char** pp, const char* e, u8* m)
+{
+    const char* p = *pp; *m = 0;
+    while (p < e && (*p == 'x' || *p == 'y' || *p == 'z' || *p == 'w')) {
+        *m |= (u8)(*p == 'x' ? 1 : *p == 'y' ? 2 : *p == 'z' ? 4 : 8); p++; }
+    if (p == *pp || p - *pp > 4) return 0;
+    *pp = p; return 1;
+}
+/* "[if (COND) ](r|o|cc)[N].MASK = _v.MASK;" */
+static int mvp_def(const char* s, const char* e, MvpStmt* st)
+{
+    u8 cond = 0;
+    if (mvp_lit(s, e, "if (")) {
+        const char* q = NULL;
+        for (const char* p = s; p + 1 < e; p++) if (p[0] == ')' && p[1] == ' ') q = p;
+        if (!q) return 0;
+        if (!mvp_uses(s + 4, q, st->use)) return 0;
+        s = q + 2; cond = 1;
+    }
+    int k;
+    if (mvp_lit(s, e, "cc[")) { k = 3; s += 3; } else if (mvp_lit(s, e, "r[")) { k = 0; s += 2; }
+    else if (mvp_lit(s, e, "o[")) { k = 1; s += 2; } else return 0;
+    int idx = 0, nd = 0;
+    while (s < e && *s >= '0' && *s <= '9' && nd < 3) { idx = idx * 10 + (*s - '0'); s++; nd++; }
+    if (!nd || idx >= MVP_REGS || !mvp_lit(s, e, "].")) return 0;
+    s += 2;
+    u8 m, m2;
+    if (!mvp_mask(&s, e, &m) || !mvp_lit(s, e, " = _v.")) return 0;
+    s += 6;
+    if (!mvp_mask(&s, e, &m2) || e - s != 1 || *s != ';' || st->ndef >= 8) return 0;
+    st->dk[st->ndef] = (u8)k; st->di[st->ndef] = (u8)idx; st->dm[st->ndef] = m; st->dc[st->ndef] = cond; st->ndef++;
+    return 1;
+}
+/* m: "VSOutput main(...) {" through the end of the text. malloc'd pruned
+ * function, NULL = keep the original (not the modelled form, or nothing to drop). */
+static char* mv_prune_main(const char* m)
+{
+    const size_t fn = strlen(m);
+    size_t nl = 1;
+    for (size_t i = 0; i < fn; i++) nl += m[i] == '\n';
+    const char** ls = (const char**)malloc(nl * sizeof *ls);
+    size_t* ln = (size_t*)malloc(nl * sizeof *ln);
+    MvpStmt* st = (MvpStmt*)calloc(nl * 4 + 16, sizeof *st);   /* a v[] line holds up to 4 fetches */
+    u8* keep = (u8*)calloc(nl * 4 + 16, 1);
+    u8* head = (u8*)calloc(nl, 1);
+    char* out = NULL;
+    size_t L = 0, ns = 0, endi = 0;
+    int ok = ls && ln && st && keep && head, only_v = 1;
+    if (ok) {
+        const char* p = m;
+        for (size_t i = 0; i < nl; i++) {
+            const char* q = strchr(p, '\n');
+            ls[L] = p; ln[L] = q ? (size_t)(q - p) : strlen(p); L++;
+            if (!q) break;
+            p = q + 1;
+        }
+        ok = 0;
+        for (size_t i = 1; i + 2 < L; i++) {
+            const char* t = ls[i]; const char* e = t + ln[i];
+            while (t < e && *t == ' ') t++;
+            if (e - t == 13 && !memcmp(t, "VSOutput Out;", 13)) { endi = i; ok = 1; break; }
+        }
+    }
+    if (ok) {   /* the position must come from o[0] alone */
+        const char* t = ls[endi + 1]; const char* e = t + ln[endi + 1];
+        while (t < e && *t == ' ') t++;
+        const char* t2 = ls[endi + 2]; const char* e2 = t2 + ln[endi + 2];
+        while (t2 < e2 && *t2 == ' ') t2++;
+        ok = e - t == 17 && !memcmp(t, "float4 _p = o[0];", 17) &&
+             mvp_lit(t2, e2, "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);");
+    }
+    static const char* const hp[] = { "float4 v[", "float4 r[", "[unroll] for (int _i", "[unroll] for (int _j",
+                                       "int4 a0 = (int4)0;", "float4 cc[2];" };
+    for (size_t i = 1; ok && i < endi; i++) {
+        const char* t = ls[i]; const char* e = t + ln[i];
+        while (t < e && *t == ' ') t++;
+        while (e > t && (e[-1] == ' ' || e[-1] == '\r')) e--;
+        if (t == e) continue;
+        if (mvp_lit(t, e, "{ float4 _v =")) {
+            MvpStmt* s = &st[ns];
+            s->p = ls[i];
+            if (memchr(t, '}', (size_t)(e - t)) || !mvp_uses(t, e, s->use)) { ok = 0; break; }
+            size_t j = i + 1;
+            for (; j < endi; j++) {
+                const char* a = ls[j]; const char* b = a + ln[j];
+                while (a < b && *a == ' ') a++;
+                while (b > a && (b[-1] == ' ' || b[-1] == '\r')) b--;
+                if (b - a == 1 && *a == '}') break;
+                if (!mvp_def(a, b, s)) { ok = 0; break; }
+            }
+            if (!ok || j >= endi) { ok = 0; break; }
+            s->n = (size_t)(ls[j] + ln[j] - s->p);
+            ns++; only_v = 0; i = j;
+            continue;
+        }
+        if (mvp_lit(t, e, "{ int4 _a = ")) {   /* "{ int4 _a = EXPR; aN.MASK = _a.MASK; }" */
+            const char* q = NULL;
+            for (const char* p = t; p + 4 < e; p++) if (p[0] == ';' && p[1] == ' ' && p[2] == 'a' && (p[3] == '0' || p[3] == '1') && p[4] == '.') q = p;
+            MvpStmt* s = &st[ns];
+            u8 m1, m2;
+            const char* r = q ? q + 5 : NULL;
+            if (!q || !mvp_uses(t + 12, q, s->use) || !mvp_mask(&r, e, &m1) || !mvp_lit(r, e, " = _a.")) { ok = 0; break; }
+            r += 6;
+            if (!mvp_mask(&r, e, &m2) || e - r != 3 || memcmp(r, "; }", 3)) { ok = 0; break; }
+            s->p = ls[i]; s->n = ln[i];
+            s->dk[0] = 4; s->di[0] = (u8)(q[3] - '0'); s->dm[0] = m1; s->ndef = 1;
+            ns++; only_v = 0;
+            continue;
+        }
+        if (mvp_lit(t, e, "v[")) {   /* "v[N]=EXPR;  v[N]=EXPR; ..." */
+            const char* p = t;
+            while (ok && p < e) {
+                while (p < e && *p == ' ') p++;
+                if (p >= e) break;
+                const char* sc = (const char*)memchr(p, ';', (size_t)(e - p));
+                if (!sc || !mvp_lit(p, sc, "v[")) { ok = 0; break; }
+                const char* q = p + 2;
+                int idx = 0, nd = 0;
+                while (q < sc && *q >= '0' && *q <= '9' && nd < 3) { idx = idx * 10 + (*q - '0'); q++; nd++; }
+                if (!nd || idx >= MVP_REGS || !mvp_lit(q, sc, "]=")) { ok = 0; break; }
+                MvpStmt* s = &st[ns];
+                if (!mvp_uses(q + 2, sc, s->use) || ns + 1 >= nl * 4 + 16) { ok = 0; break; }
+                s->p = p; s->n = (size_t)(sc - p); s->isv = 1;
+                s->dk[0] = 2; s->di[0] = (u8)idx; s->dm[0] = 15; s->ndef = 1;
+                ns++;
+                p = sc + 1;
+            }
+            continue;
+        }
+        int h = 0;
+        for (size_t k = 0; k < sizeof hp / sizeof hp[0]; k++) if (mvp_lit(t, e, hp[k])) h = 1;
+        if (!h || !only_v) { ok = 0; break; }
+        head[i] = 1;
+    }
+    size_t kept = 0;
+    if (ok) {
+        u8 live[5][MVP_REGS];
+        memset(live, 0, sizeof live);
+        live[1][0] = 15;
+        for (size_t k = ns; k-- > 0;) {
+            const MvpStmt* s = &st[k];
+            int any = 0;
+            for (int d = 0; d < s->ndef; d++) any |= live[s->dk[d]][s->di[d]] & s->dm[d];
+            if (!any) continue;
+            keep[k] = 1; kept++;
+            for (int d = 0; d < s->ndef; d++) if (!s->dc[d]) live[s->dk[d]][s->di[d]] &= (u8)~s->dm[d];
+            for (int c = 0; c < 5; c++)
+                for (int r = 0; r < MVP_REGS; r++) if (s->use[c] >> r & 1) live[c][r] = 15;
+        }
+        ok = kept < ns;
+    }
+    if (ok) {
+        out = (char*)malloc(fn + ns * 8 + 16);
+        if (out) {
+            size_t o = 0;
+            memcpy(out + o, ls[0], ln[0]); o += ln[0]; out[o++] = '\n';
+            for (size_t i = 1; i < endi; i++) if (head[i]) { memcpy(out + o, ls[i], ln[i]); o += ln[i]; out[o++] = '\n'; }
+            for (size_t k = 0; k < ns; k++) {
+                if (!keep[k]) continue;
+                if (st[k].isv) { memcpy(out + o, "    ", 4); o += 4; memcpy(out + o, st[k].p, st[k].n); o += st[k].n; out[o++] = ';'; }
+                else { memcpy(out + o, st[k].p, st[k].n); o += st[k].n; }
+                out[o++] = '\n';
+            }
+            const size_t tl = fn - (size_t)(ls[endi] - m);
+            memcpy(out + o, ls[endi], tl); o += tl;
+            out[o] = 0;
+        }
+    }
+    free((void*)ls); free(ln); free(st); free(keep); free(head);
+    return out;
+}
+/* The decompiled program (or its GPU-fetch form) -> motion-vector VS.
+ * prune: drop what cannot reach the position (mv_prune_main); *pruned = 1
+ * when that changed the text. */
+static char* mv_make_vs_text(const char* base, int prune, int* pruned)
 {
     static const char sigA[] = "VSOutput main(VSInput input) {";
     static const char sigB[] = "VSOutput main(uint _vid : SV_VertexID) {";
     const char* m = strstr(base, "VSOutput main(");
-    if (!m || strstr(base, "rsx_vtex")) return NULL;
+    if (!m || strstr(base, "rsx_vtex")) return NULL;     /* vertex texture fetch: not handled */
     const int gfv = !strncmp(m, sigB, sizeof sigB - 1);
     if (!gfv && strncmp(m, sigA, sizeof sigA - 1)) return NULL;
-    const size_t pre = (size_t)(m - base), fn = strlen(m);
+    const size_t pre = (size_t)(m - base);
+    char* pm = prune ? mv_prune_main(m) : NULL;
+    if (pruned) *pruned = pm != NULL;
+    if (pm) m = pm;
+    const size_t fn = strlen(m);
     static const char* f1[] = { "VSOutput main(", "uint _vid : SV_VertexID" };
     static const char* t1[] = { "VSOutput mv_cur(", "uint _vid" };
     static const char* f2[] = { "VSOutput main(", "uint _vid : SV_VertexID", "vp_c[", "vp_posscale", "vp_posoffset" };
     static const char* t2[] = { "VSOutput mv_prv(", "uint _vid", "vp_cp[", "vp_pps", "vp_ppo" };
     char* c1 = mv_subst(m, fn, f1, t1, 2);
     char* c2 = mv_subst(m, fn, f2, t2, 5);
+    free(pm);
     if (!c1 || !c2) { free(c1); free(c2); return NULL; }
     static const char extra[] =
         "cbuffer VPPrev : register(b3) { float4 vp_cp[512]; float4 vp_pps; float4 vp_ppo; uint4 vp_pbr; };\n"
@@ -324,7 +556,7 @@ char* r1_mv_vs_text(const char* base)
         : "MVOut main(VSInput input) { VSOutput a = mv_cur(input); VSOutput b = mv_prv(input);\n";
     static const char tail2[] =
         "    MVOut O; O.pos = a.pos; O.cur = float4(a.pos.xy - mv_k.xy * a.pos.w, a.pos.zw); O.prv = b.pos;\n"
-    "    if (mv_k.w > 0.5) { O.cur.z = mv_k.z; O.prv.z = 1e30; } else O.prv.z = 0.0; return O; }\n";
+    "    if (mv_k.w > 0.5) { O.cur.z = mv_k.z; O.prv.z = 1e30; } else O.prv.z = mv_k.w < -0.5 ? -1.0 : 0.0; return O; }\n";
     const size_t L = pre + strlen(c1) + strlen(c2) + sizeof extra + strlen(tail) + sizeof tail2 + 16;
     char* out = (char*)malloc(L);
     if (out) {
@@ -335,6 +567,10 @@ char* r1_mv_vs_text(const char* base)
     free(c1); free(c2);
     return out;
 }
+char* r1_mv_vs_text(const char* base, int prune, int* pruned) { return mv_make_vs_text(base, prune, pruned); }
+
+/* ---- rsx_ext_state.h: rsx_vsx_patch ---------------------------------------------------------------------------- */
+int r1_vsx_patch(char* hlsl, uint32_t cap, uint32_t flags) { return rsx_vsx_patch(hlsl, cap, flags); }
 
 /* ---- rsx_d3d12_backend.c: shc_hash / shc_compile_ex key ------------------------------------------------------ */
 static uint64_t shc_hash(const char* a, size_t n, uint64_t h)
@@ -342,11 +578,24 @@ static uint64_t shc_hash(const char* a, size_t n, uint64_t h)
     for (size_t i = 0; i < n; i++) { h ^= (u8)a[i]; h *= 1099511628211ull; }
     return h;
 }
-uint64_t r1_shc_key(const char* target, const char* entry, const char* src, size_t len)
+uint64_t r1_shc_key(const char* target, const char* entry, const char* src, size_t len, int strict)
 {
     uint64_t h = 14695981039346656037ull;
-    h = shc_hash("rfom-shc-v1", 11, h);
+    h = shc_hash(strict ? "rfom-shc-v1s" : "rfom-shc-v1", strict ? 12 : 11, h);
     h = shc_hash(target, strlen(target) + 1, h);
     h = shc_hash(entry, strlen(entry) + 1, h);
     return shc_hash(src, len, h);
+}
+
+/* ---- rsx_d3d12_backend.c: shc_strict_text ------------------------------------------------------------------ */
+char* r1_vs_strict_text(const char* src, size_t len, size_t* olen)
+{
+    char* z = (char*)malloc(len + 1u), *o = (char*)malloc(len + 64u);
+    if (!z || !o) { free(z); free(o); return NULL; }
+    memcpy(z, src, len); z[len] = 0;
+    const int n = rsx_vs_precise_text(z, o, len + 64u);
+    free(z);
+    if (n < 0) { free(o); return NULL; }
+    *olen = (size_t)n;
+    return o;
 }

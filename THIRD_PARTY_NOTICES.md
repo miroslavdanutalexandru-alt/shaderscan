@@ -10,7 +10,8 @@ The release `shaderscan.exe` is built from this repository only. It contains the
 | RPCS3 (program analysis, ucode hashing and shader cache format, reimplemented after `ProgramStateCache.cpp` and `rsx::shaders_cache`) | GPL-2.0 | `LICENSE` | `src/rsx_program.cpp`, `src/rpcs3_cache.cpp`, `src/backend_rpcs3.cpp` |
 | miniz 10.0.3 (zlib inflate for PSARC archives) by Rich Geldreich, RAD Game Tools and Valve Software | MIT | `third_party/miniz/LICENSE` | `third_party/miniz/` |
 | Resistance: Fall of Man port's RSX to HLSL translators (`rsx_fp_decompiler`, `rsx_vp_decompiler`) and ps3recomp headers (`ps3types.h`, `endian.h`, `log_first.h`) | MIT | `third_party/rfom_translators/LICENSE.ps3recomp`, `third_party/rfom_translators/LICENSE.rfom-port` | `third_party/rfom_translators/` |
-| Post-processing steps copied from that port's `rsx_d3d12_backend.c` and `rsx_fsr.inc` (FP state wrapper, VP forms, motion-vector shaders, cache key) | MIT (same two licences) | as above | `src/r1d3d12/r1_glue.c` |
+| Post-processing steps copied from that port's `rsx_d3d12_backend.c` and `rsx_fsr.inc` (FP state wrapper, VP forms, motion-vector shaders, strict VS text, cache key) | MIT (same two licences) | as above | `src/r1d3d12/r1_glue.c` |
+| That port's `rsx_ext_state.h` (fragment fog / flat / two-side / border patch, IEEE-strict VS text); parts adapted from the GoW Ascension recomp (https://github.com/bc160201983/GoW-Ascension-Recomp), Copyright (c) 2026 BilalReloaded | MIT | `third_party/rfom_translators/LICENSE.ps3recomp`, `third_party/rfom_translators/LICENSE.rfom-port`, `third_party/rfom_translators/LICENSE.gow-ascension` | `third_party/rfom_translators/libs/video/rsx_ext_state.h` |
 
 MIT-licensed parts keep their licence and notices; the combined program is distributed under GPL-2.0-only.
 

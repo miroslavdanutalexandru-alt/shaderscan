@@ -236,6 +236,8 @@ int rsx_fp_decompile_buffered_shadow_color_ex(
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);
+/* RSX_FP_EXTOPS (default 1): DDX/DDY/TXD/DST/LIT/STR/SFL/BEM/DP2A/RFL/TEXBEM/TXPBEM translated. */
+int rsx_fp_extops(void);
 
 /* Total byte length of the fragment program at `ucode` (including inline
  * CONST slots), up to and including the PROGRAM_END instruction, bounded by

@@ -4,7 +4,9 @@
 // Runtime cache (rsx_d3d12_backend.c shc_compile_ex): <port>\shadercache\<key>.dxbc, key = FNV-1a 64 over
 // "rfom-shc-v1", target\0, "main"\0, HLSL; the HLSL is kept next to it as <key>.hlsl (the launcher's "Rebuild shader
 // cache" recompiles a .dxbc from it). No version/driver check on .dxbc files: the key is the whole validation. FXC
-// (d3dcompiler_47 D3DCompile, flags 0, ps_5_0 / vs_5_0). Pipelines (pso_manifest_*2.bin) are recorded by the game and
+// (d3dcompiler_47 D3DCompile, flags 0, ps_5_0 / vs_5_0). Vertex shaders under RSX_VS_STRICT (default on unless the
+// GPU is NVIDIA) compile their `precise` text with D3DCOMPILE_IEEE_STRICTNESS and key as "rfom-shc-v1s" over the
+// plain text, which is also what <key>.hlsl holds. Pipelines (pso_manifest_*2.bin) are recorded by the game and
 // left alone.
 //
 // The HLSL is produced by R1's own translator (rsx_fp_decompiler.c / rsx_vp_decompiler.c compiled into this tool)
@@ -36,6 +38,8 @@
 #endif
 #include <windows.h>
 #include <d3dcompiler.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
 
 #if __has_include("../profiles/r1_profile.inc")
 #include "../profiles/r1_profile.inc"
@@ -49,8 +53,14 @@ namespace shaderscan
 	namespace
 	{
 		constexpr const char* k_backend_tag = "backend r1d3d12";
-		// Translator settings that change the generated text (rsx_fp_decompiler.c / vp_get_fp_pso getenv calls).
-		const char* const k_env_keys[] = { "RSX_RES_SCALE", "RSX_FP_KSLOTS", "RSX_ALPHATEST", "FP_SWAP_RB", "RSX_FP_DEBUG", "RSX_FSR", "RSX_FSR_REACTIVE" };
+		// rsx_fsr.inc motion-vector shader text revision: stamps without it were seeded with an older text (keys the
+		// game never asks for), so --check asks for one rescan. 3 = 0.3.0-beta (MV pixel shader reads mv_k).
+		constexpr const char* k_mv_rev = "mvtext 3";
+		// Translator settings that change the generated text (rsx_fp_decompiler.c / vp_get_fp_pso / shc_compile_ex
+		// getenv calls).
+		const char* const k_env_keys[] = { "RSX_RES_SCALE", "RSX_FP_KSLOTS", "RSX_ALPHATEST", "FP_SWAP_RB", "RSX_FP_DEBUG", "RSX_FSR",
+			"RSX_FSR_REACTIVE", "RSX_FP_EXTOPS", "RSX_FP_RFL", "RSX_FOG", "RSX_FLAT_SHADE", "RSX_TWO_SIDE_LIGHT", "RSX_BORDER_COLOR",
+			"RSX_VS_STRICT" };
 
 		// ---- the game's environment: run.bat's / settings.bat's `set "K=V"` lines win over this process's ----------
 
@@ -135,7 +145,65 @@ namespace shaderscan
 
 		// ---- keys / compiler ----------------------------------------------------------------------------------------
 
-		u64 shc_key(const char* target, const std::string& src) { return r1_shc_key(target, "main", src.data(), src.size()); }
+		u64 shc_key(const char* target, const std::string& src, bool strict = false)
+		{
+			return r1_shc_key(target, "main", src.data(), src.size(), strict ? 1 : 0);
+		}
+
+		// shc_strict_text: the precise form FXC compiles for a strict VS; empty = not a decompiler VS (keyed plain)
+		std::string strict_text(const std::string& src)
+		{
+			size_t n = 0;
+			char* t = r1_vs_strict_text(src.data(), src.size(), &n);
+			if (!t) return {};
+			std::string s(t, n);
+			std::free(t);
+			return s;
+		}
+
+		// The adapter the game creates its device on (rsx_d3d12_backend.c: first non-software adapter by
+		// DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, or MINIMUM_POWER with CELLMARK_IGPU, that takes a D3D12 FL 11.0 device).
+		// Nothing is created; 0 when unknown.
+		unsigned gpu_vendor()
+		{
+			static const unsigned v = [] {
+				unsigned id = 0;
+				HMODULE dx = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+				HMODULE d12 = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+				using factory_fn = HRESULT(WINAPI*)(REFIID, void**);
+				using device_fn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+				auto mk = dx ? reinterpret_cast<factory_fn>(reinterpret_cast<void*>(GetProcAddress(dx, "CreateDXGIFactory1"))) : nullptr;
+				auto dev = d12 ? reinterpret_cast<device_fn>(reinterpret_cast<void*>(GetProcAddress(d12, "D3D12CreateDevice"))) : nullptr;
+				IDXGIFactory6* f6 = nullptr;
+				if (mk && dev && SUCCEEDED(mk(__uuidof(IDXGIFactory6), reinterpret_cast<void**>(&f6))) && f6)
+				{
+					const DXGI_GPU_PREFERENCE pref = std::getenv("CELLMARK_IGPU") ? DXGI_GPU_PREFERENCE_MINIMUM_POWER : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
+					IDXGIAdapter1* a = nullptr;
+					for (UINT i = 0; !id && f6->EnumAdapterByGpuPreference(i, pref, __uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&a)) != DXGI_ERROR_NOT_FOUND; i++)
+					{
+						if (!a) continue;
+						DXGI_ADAPTER_DESC1 d{};
+						// a null device pointer only asks whether the adapter can make one
+						if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+							SUCCEEDED(dev(a, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr)))
+							id = d.VendorId;
+						a->Release();
+						a = nullptr;
+					}
+					f6->Release();
+				}
+				return id;
+			}();
+			return v;
+		}
+
+		// rsx_d3d12_backend.c vs_strict_on: RSX_VS_STRICT, else on unless the adapter is NVIDIA
+		bool vs_strict(const std::map<std::string, std::string>& env)
+		{
+			if (auto it = env.find("RSX_VS_STRICT"); it != env.end() && !it->second.empty()) return it->second[0] != '0';
+			const unsigned v = gpu_vendor();
+			return v && v != 0x10DEu;
+		}
 
 		std::string key_name(u64 k)
 		{
@@ -166,14 +234,15 @@ namespace shaderscan
 			return fn;
 		}
 
-		// shc_compile_ex: D3DCompile(src, len, name, NULL, NULL, "main", target, 0 (RSX_FXC_OPT=1), 0)
-		bool fxc(const std::string& src, const char* name, const char* target, std::vector<u8>& out)
+		// shc_compile_ex: D3DCompile(src, len, name, NULL, NULL, "main", target, 0 (RSX_FXC_OPT=1), 0); a strict VS
+		// compiles its precise text with D3DCOMPILE_IEEE_STRICTNESS
+		bool fxc(const std::string& src, const char* name, const char* target, std::vector<u8>& out, UINT flags = 0)
 		{
 			const d3dcompile_fn fn = load_fxc();
 			if (!fn) return false;
 			ID3DBlob* code = nullptr;
 			ID3DBlob* err = nullptr;
-			const HRESULT hr = fn(src.data(), src.size(), name, nullptr, nullptr, "main", target, 0, 0, &code, &err);
+			const HRESULT hr = fn(src.data(), src.size(), name, nullptr, nullptr, "main", target, flags, 0, &code, &err);
 			if (err) err->Release();
 			if (FAILED(hr) || !code) return false;
 			const u8* p = static_cast<const u8*>(code->GetBufferPointer());
@@ -185,6 +254,7 @@ namespace shaderscan
 		const char* source_name(const char* target, const std::string& src)
 		{
 			if (std::strcmp(target, "ps_5_0") == 0) return "guest_fp";
+			if (std::strcmp(target, "cs_5_0") == 0) return "dlss_cam_fill";
 			return src.find("ByteAddressBuffer vp_raw") != std::string::npos ? "guest_vp_gf" : "guest_vp2";
 		}
 
@@ -223,7 +293,7 @@ namespace shaderscan
 		// Units whose state changes a sampled texture's code (clamp / mirror bits on unsampled units only add helpers).
 		u32 variant_units(const r1_fp_variant& v)
 		{
-			u32 m = v.unnorm_mask | v.cube_mask;
+			u32 m = v.unnorm_mask | v.cube_mask | u32(v.fpx >> 8 & 0xFFFFu) | u32(v.fpx >> 32 & 0xFFFFu);
 			for (int u = 0; u < 16; u++)
 				if (v.shadow[u][0] || v.expand[u]) m |= 1u << u;
 			return m;
@@ -251,6 +321,13 @@ namespace shaderscan
 				s += b;
 				for (int u = 0; u < 16; u++)
 					if (v.mirror[u]) { std::snprintf(b, sizeof(b), " m%d.%u", u, v.mirror[u]); s += b; }
+			}
+			if (v.fpx)
+			{
+				std::snprintf(b, sizeof(b), " f%llX", static_cast<unsigned long long>(v.fpx));
+				s += b;
+				for (int u = 0; u < 16; u++)
+					if (v.bmirror[u]) { std::snprintf(b, sizeof(b), " b%d.%u", u, v.bmirror[u]); s += b; }
 			}
 			return s;
 		}
@@ -286,6 +363,11 @@ namespace shaderscan
 				case 'm':
 					if (std::sscanf(p, "%u.%u", &a[0], &a[1]) != 2 || a[0] > 15) return false;
 					v.mirror[a[0]] = u8(a[1]);
+					break;
+				case 'f': v.fpx = std::strtoull(p, nullptr, 16); break;
+				case 'b':
+					if (std::sscanf(p, "%u.%u", &a[0], &a[1]) != 2 || a[0] > 15) return false;
+					v.bmirror[a[0]] = u8(a[1]);
 					break;
 				default: return false;
 				}
@@ -414,6 +496,20 @@ namespace shaderscan
 						if (t + 7 < fetch.size() && fetch[t + 7] >= '0' && fetch[t + 7] <= '9') unit = std::atoi(fetch.c_str() + t + 7);
 				if (unit >= 0 && unit < 16) { v.expand[unit] = u8(mask); sampled |= 1u << unit; }
 			}
+			// rsx_fpx_patch_m (fog comes from RSX_FOG alone): flat colours, two-sided colours, border-colour units
+			if (h.find("nointerpolation float4 col0 : COLOR0;") != std::string::npos) v.fpx |= 16u;
+			if (h.find("(input._rsx_front ? input.col") != std::string::npos) v.fpx |= 8u;
+			for (int u = 0; u < 16; u++)
+			{
+				const std::string sb = "rsx_sampb(rsx_tex[" + std::to_string(u) + "], rsx_samp[" + std::to_string(u) + "], ";
+				const size_t at = h.find(sb);
+				unsigned uu = 0, ax = 0;
+				if (at == std::string::npos || std::sscanf(h.c_str() + at + sb.size(), "%uu, %uu, ", &uu, &ax) != 2 || uu != unsigned(u)) continue;
+				if (ax & 1u) v.fpx |= 1ull << (8 + u);
+				if (ax & 2u) v.fpx |= 1ull << (32 + u);
+				v.bmirror[u] = u8((ax >> 2) & 0xFu);
+				sampled |= 1u << u;
+			}
 			// a clamp / mirror mask that only names unsampled units still adds its helper function
 			auto unused_unit = [&]() -> u32 {
 				for (int u = 15; u >= 0; u--)
@@ -472,7 +568,7 @@ namespace shaderscan
 
 		u64 image_hash(const void* p, size_t n)
 		{
-			return r1_shc_key("img", "", static_cast<const char*>(p), n);
+			return r1_shc_key("img", "", static_cast<const char*>(p), n, 0);
 		}
 
 		struct job
@@ -481,7 +577,18 @@ namespace shaderscan
 			const char* target;
 			std::string src;
 			bool write_hlsl;
+			std::string strict; // RSX_VS_STRICT: the text FXC compiles (IEEE-strict) instead of src
 		};
+
+		// rsx_vsx_patch flags a recorded vertex shader text was built with (its MV / GPU-fetch forms carry them too)
+		u32 recorded_vsx(const std::string& t)
+		{
+			u32 f = 0;
+			if (t.find("Out.vsx_clip0 = ") != std::string::npos) f |= 1u;
+			if (t.find("{ uint _vk = ") != std::string::npos) f |= 2u;
+			if (t.find("Out.vsx_bc0 = o[3];") != std::string::npos) f |= 4u;
+			return f;
+		}
 
 		// --emit-profile runs a dry scan; finish() hands the learned profile to this sink.
 		thread_local std::FILE* g_profile_sink = nullptr;
@@ -496,6 +603,8 @@ namespace shaderscan
 			struct recorded_fp { u64 key; u64 norm_key; std::string text; };
 			std::vector<recorded_fp> rec_ps;      // learn source: recorded fragment HLSL
 			std::set<u64> rec_vs;                 // learn source: recorded vertex keys
+			std::set<u32> rec_vsx;                // rsx_vsx_patch variants among them
+			bool strict = false;                  // RSX_VS_STRICT in effect on this PC
 			unsigned rec_other_scale = 0;
 			std::map<std::string, unsigned> generic; // learned variant text (no x) -> recorded uses
 			std::map<u64, std::set<std::string>> exact; // FP image hash -> variant texts (with x) seen with it
@@ -526,8 +635,11 @@ namespace shaderscan
 						const std::string t = read_text(it->path());
 						if (shc_key("ps_5_0", t) == k)
 							rec_ps.push_back({ k, k, t });
-						else if (shc_key("vs_5_0", t) == k)
+						else if (shc_key("vs_5_0", t) == k || shc_key("vs_5_0", t, true) == k)
+						{
 							rec_vs.insert(k);
+							if (const u32 f = recorded_vsx(t)) rec_vsx.insert(f);
+						}
 					}
 				}
 			}
@@ -542,6 +654,7 @@ namespace shaderscan
 				{ std::error_code ae; root = fs::absolute(port_root(o, c.out), ae); }
 				env = game_env(root);
 				apply_env();
+				strict = vs_strict(env);
 				{
 					std::ifstream m(c.out / manifest_name);
 					for (std::string l; std::getline(m, l);)
@@ -556,12 +669,14 @@ namespace shaderscan
 				{
 					rec_ps.clear();
 					rec_vs.clear();
+					rec_vsx.clear();
 					load_dir(to_path(o.learn_dir), false);
 				}
 				else if (no_learn)
 				{
 					rec_ps.clear();
 					rec_vs.clear();
+					rec_vsx.clear();
 				}
 				for (auto& r : rec_ps)
 				{
@@ -591,8 +706,8 @@ namespace shaderscan
 						}
 					}
 #endif
-				c.log("r1d3d12: RSX_RES_SCALE %s, recorded %zu fragment (%u at another scale) / %zu vertex sources, %zu learned states\n",
-					g9(1.0 / res_inv).c_str(), rec_ps.size(), rec_other_scale, rec_vs.size(), generic.size());
+				c.log("r1d3d12: RSX_RES_SCALE %s, vertex shaders %s (GPU vendor %04X), recorded %zu fragment (%u at another scale) / %zu vertex sources, %zu learned states\n",
+					g9(1.0 / res_inv).c_str(), strict ? "IEEE-strict" : "plain", gpu_vendor(), rec_ps.size(), rec_other_scale, rec_vs.size(), generic.size());
 				return 0;
 			}
 
@@ -663,13 +778,22 @@ namespace shaderscan
 				std::vector<job> jobs;
 				std::unordered_set<u64> keys;
 				std::set<std::string> fp_variants;
+				// shc_compile_ex: a vertex shader under RSX_VS_STRICT keys as "rfom-shc-v1s" when it has the precise form
+				auto vs_key = [&](const std::string& src, std::string* st) -> u64 {
+					std::string s = strict ? strict_text(src) : std::string();
+					const u64 k = shc_key("vs_5_0", src, !s.empty());
+					if (st) *st = std::move(s);
+					return k;
+				};
 				auto add = [&](const char* target, std::string&& src) {
-					const u64 k = shc_key(target, src);
+					const bool ps = std::strcmp(target, "ps_5_0") == 0;
+					std::string st;
+					const u64 k = ps ? shc_key(target, src) : vs_key(src, &st);
 					if (!keys.insert(k).second) return;
-					if (std::strcmp(target, "ps_5_0") == 0) { if (rec_by_norm.count(k)) ps_hit.insert(k); }
+					if (ps) { if (rec_by_norm.count(k)) ps_hit.insert(k); }
 					else if (rec_vs.count(k)) vs_hit.insert(k);
 					if (dxbc.count(k)) { res.entries_existing++; return; }
-					jobs.push_back({ k, target, std::move(src), !hlsl.count(k) });
+					jobs.push_back({ k, target, std::move(src), !hlsl.count(k), std::move(st) });
 				};
 				// rsx_fsr.inc fsr_mode: FSR / DLSS / XeSS on -> every VS also gets a motion-vector form
 				const bool fsr = [&] { auto it = env.find("RSX_FSR"); return it != env.end() && std::atoi(it->second.c_str()) > 0; }();
@@ -711,24 +835,58 @@ namespace shaderscan
 					}
 					if ((++n & 15) == 0 || n == fimgs.size()) c.step("translate", n, unsigned(fimgs.size()));
 				}
+				// rsx_fsr.inc mv_get_vs: with RSX_FSR_MV_PRUNE (default) the game first looks the unpruned motion VS up
+				// and compiles the pruned one only on a miss, so the unpruned text is what is seeded; a recorded pruned
+				// one counts as reproduced
+				const bool mv_prune = [&] { const char* e = std::getenv("RSX_FSR_MV_PRUNE"); return !(e && e[0] == '0'); }();
+				auto add_mv = [&](const char* base) {
+					if (char* m = r1_mv_vs_text(base, 0, nullptr)) { add("vs_5_0", m); std::free(m); }
+					int pruned = 0;
+					if (mv_prune && !rec_vs.empty())
+						if (char* m = r1_mv_vs_text(base, 1, &pruned))
+						{
+							if (pruned)
+								if (const u64 k = vs_key(m, nullptr); rec_vs.count(k)) vs_hit.insert(k);
+							std::free(m);
+						}
+				};
+				// one vertex program as vp_get_vs_uncached builds it (vsx: rsx_vsx_patch variant), with its GPU-fetch
+				// form (none for point sprites) and their motion-vector forms
+				auto add_vp = [&](std::string&& t, u32 vsx) {
+					size_t gl = 0;
+					if (!(vsx & 2u))
+						if (char* g = r1_gf_text(t.c_str(), &gl))
+						{
+							if (fsr) add_mv(g);
+							add("vs_5_0", std::string(g, gl));
+							std::free(g);
+						}
+					if (fsr) add_mv(t.c_str());
+					add("vs_5_0", std::move(t));
+				};
+				static char vbuf[R1_HLSL_CAP];
+				unsigned vsx_found = 0;
 				for (const auto& vp : progs.vps)
 					for (const auto& im : vp.images)
 					{
 						const int r = r1_vp_hlsl(reinterpret_cast<const uint8_t*>(im.data()), uint32_t(im.size() * 4), buf, sizeof(buf));
 						if (r <= 0) continue;
-						std::string t = buf;
-						size_t gl = 0;
-						if (char* g = r1_gf_text(buf, &gl))
+						// clip-plane / point-sprite / back-colour variants: only those this program was recorded with
+						for (u32 f : rec_vsx)
 						{
-							if (fsr)
-								if (char* m = r1_mv_vs_text(g)) { add("vs_5_0", m); std::free(m); }
-							add("vs_5_0", std::string(g, gl));
-							std::free(g);
+							std::memcpy(vbuf, buf, std::strlen(buf) + 1);
+							if (r1_vsx_patch(vbuf, sizeof(vbuf), f) != 0) continue;
+							std::string t = vbuf;
+							bool seen = rec_vs.count(vs_key(t, nullptr)) != 0;
+							if (!seen && !(f & 2u))
+								if (char* g = r1_gf_text(vbuf, nullptr)) { seen = rec_vs.count(vs_key(g, nullptr)) != 0; std::free(g); }
+							if (!seen) continue;
+							vsx_found++;
+							add_vp(std::move(t), f);
 						}
-						if (fsr)
-							if (char* m = r1_mv_vs_text(t.c_str())) { add("vs_5_0", m); std::free(m); }
-						add("vs_5_0", std::move(t));
+						add_vp(std::string(buf), 0);
 					}
+				if (!rec_vsx.empty()) c.log("r1d3d12: %u recorded vertex program variants (clip planes / point sprites / back colours)\n", vsx_found);
 				if (fsr)
 				{
 					// rsx_fsr.inc mv_init: the motion-vector pixel shader and its reactive-mask form
@@ -765,7 +923,8 @@ namespace shaderscan
 						for (size_t i; (i = next++) < jobs.size();)
 						{
 							const job& j = jobs[i];
-							if (fxc(j.src, source_name(j.target, j.src), j.target, code))
+							if (j.strict.empty() ? fxc(j.src, source_name(j.target, j.src), j.target, code)
+												 : fxc(j.strict, source_name(j.target, j.src), j.target, code, D3DCOMPILE_IEEE_STRICTNESS))
 							{
 								const std::string base = key_name(j.key);
 								{
@@ -801,7 +960,7 @@ namespace shaderscan
 					{
 						std::ofstream stamp(st_tmp, std::ios::trunc);
 						stamp << "shaderscan " << SHADERSCAN_VERSION << "\n" << k_backend_tag << "\nenv " << env_fingerprint(env) << "\nroot " << u8str(root) << "\nfp " << res.fp_programs
-							  << "\nvp " << res.vp_programs << "\nvariants " << res.fp_variants << "\nentries " << res.entries_total << "\n";
+							  << "\nvp " << res.vp_programs << "\nvariants " << res.fp_variants << "\nentries " << res.entries_total << "\n" << k_mv_rev << "\nvsstrict " << (strict ? 1 : 0) << "\n";
 					}
 					fs::rename(st_tmp, c.out / stamp_name, ec);
 					if (ec) return c.fail("cannot write %s", u8str(c.out / stamp_name).c_str());
@@ -850,9 +1009,13 @@ namespace shaderscan
 				if (!(f >> tool >> ver) || ver != SHADERSCAN_VERSION) return 1;
 				std::getline(f, l);
 				std::string env_line, root_line;
+				bool mv_rev = false;
+				int st = -1;
 				while (std::getline(f, l))
 				{
 					if (l == "nothing-found") return 0;
+					if (l == k_mv_rev) mv_rev = true;
+					if (l.rfind("vsstrict ", 0) == 0) st = std::atoi(l.c_str() + 9);
 					if (l.rfind("env ", 0) == 0) env_line = l.substr(4);
 					if (l.rfind("root ", 0) == 0) root_line = l.substr(5);
 				}
@@ -860,7 +1023,9 @@ namespace shaderscan
 				shaderscan_opts o{};
 				std::error_code ec;
 				const fs::path root = !root_line.empty() && fs::is_directory(to_path(root_line.c_str()), ec) ? to_path(root_line.c_str()) : port_root(o, out);
-				return env_line != env_fingerprint(game_env(root));
+				// a new GPU vendor changes RSX_VS_STRICT's default, so every vertex shader key
+				const auto genv = game_env(root);
+				return !mv_rev || env_line != env_fingerprint(genv) || st != (vs_strict(genv) ? 1 : 0);
 			}
 
 			int verify(const shaderscan_opts& o, const fs::path& dir, std::FILE* rep) override
@@ -880,22 +1045,27 @@ namespace shaderscan
 					else bins.insert(k);
 				}
 				std::sort(srcs.begin(), srcs.end());
-				struct row { u64 key; std::string text; const char* target; };
+				struct row { u64 key; std::string text; const char* target; bool strict; };
 				std::vector<row> rows;
-				unsigned ps = 0, vs = 0, mismatch = 0;
+				unsigned ps = 0, vs = 0, cs = 0, mismatch = 0, vs_strict_n = 0;
 				std::vector<std::string> examples;
 				for (const auto& [k, p] : srcs)
 				{
 					std::string t = read_text(p);
-					const char* target = shc_key("ps_5_0", t) == k ? "ps_5_0" : shc_key("vs_5_0", t) == k ? "vs_5_0" : nullptr;
+					const bool st = shc_key("vs_5_0", t, true) == k;
+					// cs_5_0: rsx_fsr.inc's DLSS camera-motion fill (fixed text the game compiles itself; not seeded)
+					const char* target = shc_key("ps_5_0", t) == k ? "ps_5_0"
+						: (st || shc_key("vs_5_0", t) == k) ? "vs_5_0"
+						: shc_key("cs_5_0", t) == k ? "cs_5_0" : nullptr;
+					if (st) vs_strict_n++;
 					if (!target)
 					{
 						if (examples.size() < 8) examples.push_back(key_name(k) + ".hlsl: key does not re-derive");
 						mismatch++;
 						continue;
 					}
-					(target[0] == 'p' ? ps : vs)++;
-					rows.push_back({ k, std::move(t), target });
+					(target[0] == 'p' ? ps : target[0] == 'v' ? vs : cs)++;
+					rows.push_back({ k, std::move(t), target, st });
 				}
 				unsigned no_src = 0;
 				for (u64 k : bins)
@@ -913,7 +1083,14 @@ namespace shaderscan
 					{
 						const row& r = rows[i];
 						if (!bins.count(r.key)) { nobin++; continue; }
-						if (!fxc(r.text, source_name(r.target, r.text), r.target, code)) { fail++; continue; }
+						const std::string st = r.strict ? strict_text(r.text) : std::string();
+						if (r.strict && st.empty()) { fail++; continue; }
+						if (!(r.strict ? fxc(st, source_name(r.target, r.text), r.target, code, D3DCOMPILE_IEEE_STRICTNESS)
+									   : fxc(r.text, source_name(r.target, r.text), r.target, code)))
+						{
+							fail++;
+							continue;
+						}
 						if (read_file(dir / (key_name(r.key) + ".dxbc"), disk) && disk == code) same++;
 						else
 						{
@@ -934,11 +1111,11 @@ namespace shaderscan
 				}
 				(void)o;
 				std::fprintf(rep, "verify %s (r1d3d12 shadercache)\n", u8str(dir).c_str());
-				std::fprintf(rep, "  sources %zu: keys re-derived from content %u ps_5_0 + %u vs_5_0, %u disagree; %u bad file names\n", srcs.size(), ps,
-					vs, mismatch, bad_name);
+				std::fprintf(rep, "  sources %zu: keys re-derived from content %u ps_5_0 + %u vs_5_0 (%u IEEE-strict) + %u cs_5_0, %u disagree; %u bad file names\n",
+					srcs.size(), ps, vs, vs_strict_n, cs, mismatch, bad_name);
 				std::fprintf(rep, "  bytecode %zu: %u without a source\n", bins.size(), no_src);
 				if (have_fxc)
-					std::fprintf(rep, "  recompiled with d3dcompiler_47 (flags 0): %u byte-identical, %u differ, %u fail, %u source without bytecode\n",
+					std::fprintf(rep, "  recompiled with d3dcompiler_47 (flags 0; strict VS: IEEE strictness): %u byte-identical, %u differ, %u fail, %u source without bytecode\n",
 						unsigned(same), unsigned(differ), unsigned(fail), unsigned(nobin));
 				else std::fprintf(rep, "  d3dcompiler_47.dll not found: bytecode not checked\n");
 				for (const auto& e : examples) std::fprintf(rep, "  ! %s\n", e.c_str());
