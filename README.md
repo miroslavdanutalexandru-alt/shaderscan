@@ -66,6 +66,10 @@ game files ──► front end (per engine) ──► program_set (dedupe by RPC
 
    Each fragment program gets up to `--variants` state templates × `--td` texture-dimension combinations ×
    `--props` pipeline states. Every vertex program and output mask is emitted at least once.
+   RPCS3 sets two control bits from draw state, so the profile's templates that differ from a chosen one only in
+   them are added too (`rpcs3`): `EMULATE_DEPTH_COMPARE` (0x08000000, depth-EQUAL passes) always, and
+   `TEXTURE_FORMAT_CONVERT` (0x04000000, bound textures that need a format remap) when the template was used at least
+   half as often as the least used chosen one. Each keeps its own learned pipeline state.
 5. **Write** (`rpcs3`). It writes `raw\<hash>.fp` (exact guest ucode), `raw\<hash>.vp` (RSXVertexProgram data) and
    a 672-byte `pipeline_data` record per entry. The file name is built from the same four hashes RPCS3 uses (ucode
    hashes, `hash_struct(vk::pipeline_props)`, `hash_array(state params)`). Modification times are placed after every
@@ -168,8 +172,8 @@ Without `--progress`, human-readable progress goes to stderr as `[<phase>] <done
 ### Versions and stamps
 
 `shaderscan.stamp` in the output dir records `SHADERSCAN_VERSION` (currently **1**), the back end, and for
-`r1d3d12` the game root and environment fingerprint. `--check` exits 1 when that does not match, which makes a
-launcher rescan. `SHADERSCAN_VERSION` is only raised when the output changes; release numbers (`v1.0.0`, ...) can
+`r1d3d12` the game root and environment fingerprint, for `rpcs3` the control-bit variant revision (`ctrlvar`).
+`--check` exits 1 when that does not match, which makes a launcher rescan. `SHADERSCAN_VERSION` is only raised when the output changes; release numbers (`v1.0.0`, ...) can
 change without it, so updating the exe does not force a rescan. `shaderscan --version` prints both.
 
 ## Launcher contract
@@ -250,6 +254,13 @@ cost of more entries to compile in the preload:
 | 6 / 2 (default) | 6.3 k | 970 / 1505 |
 | 12 / 2 | 12.3 k | 1289 / 1505 |
 | 24 / 4 | 24.1 k | 1362 / 1505 (saturates) |
+
+Control-bit siblings (v1.0.2, embedded profile, defaults, measured on another recorded cache):
+
+| game | fragment variants v1.0.1 → v1.0.2 | recorded pipelines with a generated FP state |
+|---|---|---|
+| R2 | 2382 → 3108 | 349 → 383 / 419 (83 → 91 %) |
+| R3 | 6311 → 9268 | 274 → 373 / 514 (53 → 73 %); `--variants 9` alone: 9268 variants, 344 / 514 |
 
 **r1d3d12** (R1, keys normalised to a 3× scale):
 

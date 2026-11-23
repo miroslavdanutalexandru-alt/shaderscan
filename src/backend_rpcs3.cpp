@@ -116,6 +116,55 @@ namespace shaderscan
 			return out;
 		}
 
+		// RSXGraphEngine.cpp sets these two fragment-control bits from state at draw time, so one program meets
+		// them in several combinations: TEXTURE_FORMAT_CONVERT when a bound texture needs a format remap (SNORM, sRGB,
+		// BX2 with format features, renormalisation), EMULATE_DEPTH_COMPARE for a polygon draw with depth func EQUAL.
+		constexpr u32 ctrl_texture_format_convert = 0x04000000u;
+		constexpr u32 ctrl_emulate_depth_compare = 0x08000000u;
+		constexpr u32 ctrl_runtime_bits = ctrl_texture_format_convert | ctrl_emulate_depth_compare;
+
+		struct pick
+		{
+			int index;        // template whose props are used
+			u32 ctrl_hi;
+			bool sibling;     // added for ctrl_runtime_bits (no BX2 forcing: the bit is what differs)
+		};
+
+		// The K most used templates, then the profile's other templates that differ from one of them only in
+		// ctrl_runtime_bits (same centroid / MRT): combinations seen in play, with their own learned state (so
+		// EMULATE_DEPTH_COMPARE comes with the depth-EQUAL pass's state). EMULATE_DEPTH_COMPARE-only siblings are cheap
+		// and always taken. A TEXTURE_FORMAT_CONVERT sibling adds a variant to every textured program, so it is taken only
+		// when it was used at least half as often as the least used base template.
+		// in the stamp: caches written before these variants existed are rescanned by --check
+		constexpr const char* k_ctrl_rev = "ctrlvar 1";
+
+		std::vector<pick> pick_templates(const std::vector<state_template>& list, int K, bool textured)
+		{
+			std::vector<pick> out;
+			for (int ti = 0; ti < K && ti < int(list.size()); ti++) out.push_back({ ti, list[size_t(ti)].ctrl_hi, false });
+			const size_t base = out.size();
+			u64 wmin = ~0ull;
+			for (size_t b = 0; b < base; b++) wmin = std::min(wmin, list[size_t(out[b].index)].weight);
+			for (size_t b = 0; b < base; b++)
+			{
+				const state_template& t = list[size_t(out[b].index)];
+				for (int j = 0; j < int(list.size()); j++)
+				{
+					const state_template& s = list[size_t(j)];
+					const u32 d = s.ctrl_hi ^ t.ctrl_hi;
+					if (!d || (d & ~ctrl_runtime_bits) || s.centroid != t.centroid || s.mrt != t.mrt) continue;
+					if ((d & ctrl_texture_format_convert) && (!textured || s.weight * 2 < wmin)) continue;
+					const bool dup = std::any_of(out.begin(), out.end(), [&](const pick& p)
+					{
+						const state_template& o = list[size_t(p.index)];
+						return p.ctrl_hi == s.ctrl_hi && o.centroid == s.centroid && o.mrt == s.mrt;
+					});
+					if (!dup) out.push_back({ j, s.ctrl_hi, true });
+				}
+			}
+			return out;
+		}
+
 		pipeline_record make_record(const vertex_program& vp, u32 vp_output, const fragment_program& fp, const fp_state& st, const props_blob& props)
 		{
 			pipeline_record r;
@@ -262,12 +311,14 @@ namespace shaderscan
 					size_t vi;
 					if (auto it = fp_vp.find(fp.hash); it != fp_vp.end() && progs.vp_index.count(best(it->second))) vi = progs.vp_index[best(it->second)];
 					else vi = rr_vp++ % progs.vps.size();
+					const std::vector<pick> picks = pick_templates(list, K, textured);
 					for (const auto& hs : fp.states)
-						for (int ti = 0; ti < K && ti < int(list.size()); ti++)
+						for (int ti = 0; ti < int(picks.size()); ti++)
 						{
-							const state_template& t = list[size_t(ti)];
+							const state_template& t = list[size_t(picks[size_t(ti)].index)];
 							fp_state st;
-							st.ctrl = hs.shader_ctrl | t.ctrl_hi | ((textured && fp.bx2) ? 0x4000000u : 0u);
+							st.ctrl = hs.shader_ctrl | picks[size_t(ti)].ctrl_hi;
+							if (!picks[size_t(ti)].sibling && textured && fp.bx2) st.ctrl |= ctrl_texture_format_convert;
 							st.tcc = hs.texcoord_mask;
 							st.lighting = t.centroid ? u16(hs.centroid_mask << 1) : 0;
 							st.mrt = t.mrt;
@@ -393,7 +444,7 @@ namespace shaderscan
 					{
 						std::ofstream stamp(st_tmp, std::ios::trunc);
 						stamp << "shaderscan " << SHADERSCAN_VERSION << "\nfp " << res.fp_programs << "\nvp " << res.vp_programs << "\nvariants " << res.fp_variants
-							  << "\nentries " << res.entries_total << "\n";
+							  << "\nentries " << res.entries_total << "\n" << k_ctrl_rev << "\n";
 					}
 					fs::rename(st_tmp, out / stamp_name, ec);
 					if (ec) return c.fail("cannot write %s", u8str(out / stamp_name).c_str());
@@ -425,10 +476,12 @@ namespace shaderscan
 			int needs_run(const fs::path& out) const override
 			{
 				std::ifstream f(out / stamp_name);
-				std::string tool;
+				std::string tool, l;
 				int ver = 0;
-				if (!(f >> tool >> ver)) return 1;
-				return ver != SHADERSCAN_VERSION;
+				if (!(f >> tool >> ver) || ver != SHADERSCAN_VERSION) return 1;
+				while (std::getline(f, l))
+					if (l == "nothing-found" || l == k_ctrl_rev) return 0;
+				return 1;
 			}
 
 			int verify(const shaderscan_opts& o, const fs::path& dir, std::FILE* rep) override

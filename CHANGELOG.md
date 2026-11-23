@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.0.2 (2026-11-23)
+
+`rpcs3` back end (Resistance 2 / 3): fragment variants for the two control bits RPCS3 sets from draw state.
+
+- `EMULATE_DEPTH_COMPARE` (0x08000000, polygon draws with depth func EQUAL) and `TEXTURE_FORMAT_CONVERT`
+  (0x04000000, a bound texture needs a format remap) give one program several fragment keys. Templates of the
+  profile that differ from a chosen one only in these bits are now added, with their own learned pipeline state:
+  depth-compare ones always, format-convert ones when used at least half as often as the least used chosen template.
+  Embedded profiles: R2 2382 -> 3108 fragment variants, recorded pipelines with a generated fragment state 83 -> 91 %;
+  R3 6311 -> 9268, 53 -> 73 % (`--variants 9` alone gets 67 % for the same count).
+- The stamp gets a `ctrlvar 1` line. `--check` asks for a rescan of R2/R3 caches written without it (it only adds
+  the new entries). `SHADERSCAN_VERSION` stays 1, so R1 (`r1d3d12`) caches are not rescanned.
+
 ## v1.0.1 (2026-11-20)
 
 Matches the shader text and keys of Resistance: Fall of Man port v0.3.0-beta. The R2/R3 (`rpcs3`) back end is
